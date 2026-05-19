@@ -1,0 +1,13 @@
+{
+  "name": "sp500-weekly-scanner",
+  "version": "1.0.0",
+  "description": "Weekly S&P 500 aggressive screener + Claude 8-filter analysis",
+  "main": "scripts/weekly-scan.js",
+  "scripts": {
+    "scan": "node scripts/weekly-scan.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "yahoo-finance2": "^2.13.3"
+  }
+}

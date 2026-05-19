@@ -1,0 +1,30 @@
+name: Weekly S&P 500 Scan
+
+on:
+  schedule:
+    - cron: '0 14 * * 1'   # Every Monday 9AM ET (14:00 UTC)
+  workflow_dispatch:         # Manual trigger from GitHub UI
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write          # Needed to create GitHub Issues
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run weekly scan
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}       # optional
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}         # auto-provided by GitHub
+          GITHUB_REPO: ${{ github.repository }}             # e.g. yourname/repo
+        run: node scripts/weekly-scan.js
