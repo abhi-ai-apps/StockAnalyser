@@ -1,11 +1,11 @@
 // weekly-scan.js
 // Usage: node weekly-scan.js
-// Env:   ANTHROPIC_API_KEY, SLACK_WEBHOOK (optional), GITHUB_TOKEN + GITHUB_REPO (optional)
+// Env:   GEMINI_API_KEY, SLACK_WEBHOOK (optional), GITHUB_TOKEN + GITHUB_REPO (optional)
 
-const Anthropic = require("@anthropic-ai/sdk");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 const yahooFinance = require("yahoo-finance2").default;
 
-const client = new Anthropic(); // reads ANTHROPIC_API_KEY
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -174,27 +174,19 @@ function scoreStock(q) {
 
 async function analyzeStock(ticker) {
   try {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 2000,
-        system: ANALYST_SYSTEM,
-        messages: [{
-          role: "user",
-          content: `Search for the latest financial data, earnings, analyst ratings, and news for ${ticker}. Run the full 8-filter analysis.
-
-Return ONLY this JSON (no markdown, no extra text):
-{"ticker":"${ticker}","companyName":"","sector":"","currentPrice":"","marketCap":"","filters":{"revenueGrowth":{"rating":"PASS","data":"","justification":""},"profitability":{"rating":"PASS","data":"","justification":""},"freeCashFlow":{"rating":"PASS","data":"","justification":""},"balanceSheet":{"rating":"PASS","data":"","justification":""},"moat":{"rating":"PASS","data":"","justification":""},"valuation":{"rating":"PASS","data":"","justification":""},"leadership":{"rating":"PASS","data":"","justification":""},"risk":{"rating":"PASS","data":"","justification":""}},"passCount":0,"verdict":"","thesis":["","",""],"nextCatalyst":""}`
-        }],
-        tools: [{ type: "web_search_20250305", name: "web_search" }]
-      })
+    const model = genAI.getGenerativeModel({
+      model: "gemini-2.0-flash",
+      systemInstruction: ANALYST_SYSTEM,
+      tools: [{ googleSearch: {} }],
     });
 
-    if (!res.ok) throw new Error(`API ${res.status}`);
-    const data = await res.json();
-    const text = data.content.filter(b => b.type === "text").map(b => b.text).join("");
+    const prompt = `Search for the latest financial data, earnings, analyst ratings, and news for ${ticker}. Run the full 8-filter analysis.
+
+Return ONLY this JSON (no markdown, no extra text):
+{"ticker":"${ticker}","companyName":"","sector":"","currentPrice":"","marketCap":"","filters":{"revenueGrowth":{"rating":"PASS","data":"","justification":""},"profitability":{"rating":"PASS","data":"","justification":""},"freeCashFlow":{"rating":"PASS","data":"","justification":""},"balanceSheet":{"rating":"PASS","data":"","justification":""},"moat":{"rating":"PASS","data":"","justification":""},"valuation":{"rating":"PASS","data":"","justification":""},"leadership":{"rating":"PASS","data":"","justification":""},"risk":{"rating":"PASS","data":"","justification":""}},"passCount":0,"verdict":"","thesis":["","",""],"nextCatalyst":""}`;
+
+    const response = await model.generateContent(prompt);
+    const text = response.response.text();
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return null;
     const result = JSON.parse(jsonMatch[0]);
