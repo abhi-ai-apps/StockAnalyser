@@ -2,8 +2,9 @@
 // Usage: node weekly-scan.js
 // Env:   GEMINI_API_KEY, SLACK_WEBHOOK (optional), GITHUB_TOKEN + GITHUB_REPO (optional)
 
-const { GoogleGenerativeAI } = require("@google/generative-ai");
-const yahooFinance = require("yahoo-finance2").default;
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import yahooFinance from "yahoo-finance2";
+import { mkdirSync, writeFileSync } from "fs";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
