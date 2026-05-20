@@ -462,7 +462,7 @@ function formatHtmlPage(strongBuys, allResults, screenerStats) {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  if (process.env.ENABLE_SCAN === "false") {
+  if (process.env.ENABLE_SCAN === "false" && process.env.GITHUB_EVENT_NAME !== "workflow_dispatch") {
     log("Scan disabled (ENABLE_SCAN=false). Exiting.");
     process.exit(0);
   }
