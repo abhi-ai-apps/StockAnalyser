@@ -8,8 +8,10 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    if: vars.ENABLE_SCAN == 'true'
     permissions:
-      issues: write          # Needed to create GitHub Issues
+      issues: write          # Create GitHub Issues
+      contents: write        # Push to gh-pages branch
 
     steps:
       - uses: actions/checkout@v4
@@ -27,4 +29,12 @@ jobs:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}       # optional
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}         # auto-provided by GitHub
           GITHUB_REPO: ${{ github.repository }}             # e.g. yourname/repo
+          ENABLE_SCAN: ${{ vars.ENABLE_SCAN }}              # repo variable kill-switch
         run: node scripts/weekly-scan.js
+
+      - name: Deploy dashboard to GitHub Pages
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          folder: dist
+          branch: gh-pages
+          single-commit: true
