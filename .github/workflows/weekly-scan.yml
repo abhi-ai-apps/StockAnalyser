@@ -33,7 +33,9 @@ jobs:
         run: node scripts/weekly-scan.js
 
       - name: Deploy dashboard to GitHub Pages
+        if: always()
         uses: JamesIves/github-pages-deploy-action@v4
+        continue-on-error: true
         with:
           folder: dist
           branch: gh-pages
