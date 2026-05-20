@@ -467,84 +467,84 @@ async function main() {
     process.exit(0);
   }
 
-  console.log("\n╔══════════════════════════════════════════════════════╗");
-  console.log("║          S&P 500 AGGRESSIVE WEEKLY SCANNER          ║");
-  console.log(`║          ${new Date().toLocaleDateString("en-US", { weekday:"long", month:"short", day:"numeric" }).padEnd(42)}║`);
-  console.log("╚══════════════════════════════════════════════════════╝\n");
+  // Initialise before try so the finally block can always write dist/
+  let allQuotes = [], passed = [], topStocks = [], strongBuys = [], allResults = [];
+  let screenerStats = { total: 0, afterFilter: 0, topN: 0 };
 
-  // 1. Get tickers
-  const allTickers = await getSP500Tickers();
+  try {
+    console.log("\n╔══════════════════════════════════════════════════════╗");
+    console.log("║          S&P 500 AGGRESSIVE WEEKLY SCANNER          ║");
+    console.log(`║          ${new Date().toLocaleDateString("en-US", { weekday:"long", month:"short", day:"numeric" }).padEnd(42)}║`);
+    console.log("╚══════════════════════════════════════════════════════╝\n");
 
-  // 2. Fetch all quotes from Yahoo Finance (free, no key)
-  const allQuotes = await fetchAllQuotes(allTickers);
+    // 1. Get tickers
+    const allTickers = await getSP500Tickers();
 
-  // 3. Pre-filter (market cap + analyst consensus only — both reliably in quote())
-  const passed = preFilter(allQuotes);
-  log(`\nPre-filter: ${allQuotes.length} stocks → ${passed.length} passed`);
-  log(`  Criteria: MCap>$${SCREEN.minMarketCap/1e9}B, Analyst≤${SCREEN.maxAnalystMean}`);
+    // 2. Fetch all quotes from Yahoo Finance (free, no key)
+    allQuotes = await fetchAllQuotes(allTickers);
 
-  // 4. Score and rank, then take top N for AI analysis
-  const ranked = passed
-    .map(q => ({ ...q, _score: scoreStock(q) }))
-    .sort((a, b) => b._score - a._score);
+    // 3. Pre-filter (market cap + analyst consensus only — both reliably in quote())
+    passed = preFilter(allQuotes);
+    log(`\nPre-filter: ${allQuotes.length} stocks → ${passed.length} passed`);
+    log(`  Criteria: MCap>$${SCREEN.minMarketCap/1e9}B, Analyst≤${SCREEN.maxAnalystMean}`);
 
-  const topStocks = ranked.slice(0, CONFIG.topN);
+    // 4. Score and rank, then take top N for AI analysis
+    const ranked = passed
+      .map(q => ({ ...q, _score: scoreStock(q) }))
+      .sort((a, b) => b._score - a._score);
 
-  log(`\nTop ${CONFIG.topN} by score (selected for AI analysis):`);
-  for (const q of topStocks) {
-    log(`  ${q.symbol?.padEnd(6)} score:${q._score}  epsGrowth:${((q.earningsQuarterlyGrowth||0)*100).toFixed(0)}%  analystMean:${(q.recommendationMean||0).toFixed(1)}  grossMargin:${((q.grossMargins||0)*100).toFixed(0)}%`);
-  }
+    topStocks = ranked.slice(0, CONFIG.topN);
 
-  // 5. Deep AI analysis on top N
-  const strongBuys = [];
-  const allResults = [];
-
-  log(`\n── Analyzing top ${topStocks.length} stocks with Gemini ──`);
-  for (const q of topStocks) {
-    const ticker = q.symbol;
-    if (!ticker) continue;
-    log(`  Analyzing ${ticker}...`);
-    const result = await analyzeStock(ticker);
-    if (result) {
-      allResults.push(result);
-      log(`  → ${ticker}: ${result.verdict} (${result.passCount}/8 pass)`);
-      if (result.verdict === "STRONG BUY") {
-        strongBuys.push(result);
-        log(`  ★ STRONG BUY: ${ticker}`);
-      }
+    log(`\nTop ${CONFIG.topN} by score (selected for AI analysis):`);
+    for (const q of topStocks) {
+      log(`  ${q.symbol?.padEnd(6)} score:${q._score}  epsGrowth:${((q.earningsQuarterlyGrowth||0)*100).toFixed(0)}%  analystMean:${(q.recommendationMean||0).toFixed(1)}  grossMargin:${((q.grossMargins||0)*100).toFixed(0)}%`);
     }
-    await sleep(CONFIG.delayBetweenCalls);
+
+    // 5. Deep AI analysis on top N
+    log(`\n── Analyzing top ${topStocks.length} stocks with Gemini ──`);
+    for (const q of topStocks) {
+      const ticker = q.symbol;
+      if (!ticker) continue;
+      log(`  Analyzing ${ticker}...`);
+      const result = await analyzeStock(ticker);
+      if (result) {
+        allResults.push(result);
+        log(`  → ${ticker}: ${result.verdict} (${result.passCount}/8 pass)`);
+        if (result.verdict === "STRONG BUY") {
+          strongBuys.push(result);
+          log(`  ★ STRONG BUY: ${ticker}`);
+        }
+      }
+      await sleep(CONFIG.delayBetweenCalls);
+    }
+
+    // 6. Print scorecard
+    printScorecard(allResults);
+
+    screenerStats = { total: allQuotes.length, afterFilter: passed.length, topN: topStocks.length };
+
+    // 7. Publish results
+    log("Publishing results...");
+
+    const slackMsg = formatSlackMessage(strongBuys, allResults);
+    await postToSlack(slackMsg);
+
+    const date = new Date().toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
+    const issueTitle = `📈 Weekly Scan ${date} — ${strongBuys.length} Strong Buy${strongBuys.length !== 1 ? "s" : ""} found`;
+    await createGithubIssue(issueTitle, formatGithubIssue(strongBuys, allResults, screenerStats));
+
+    console.log("\n" + slackMsg.replace(/\*/g, ""));
+    log(`\nDone. Analyzed ${allResults.length} of ${CONFIG.topN} top-scored stocks.`);
+    log(`Strong Buys: ${strongBuys.map(r => r.ticker).join(", ") || "none"}`);
+
+  } finally {
+    // Always write dist/index.html so the Pages deploy step never fails
+    // due to a missing folder, even when the scan errors out mid-run.
+    const outDir = path.resolve("dist");
+    mkdirSync(outDir, { recursive: true });
+    writeFileSync(path.join(outDir, "index.html"), formatHtmlPage(strongBuys, allResults, screenerStats));
+    log("  ✓ Generated dist/index.html");
   }
-
-  // 6. Print scorecard
-  printScorecard(allResults);
-
-  const screenerStats = { total: allQuotes.length, afterFilter: passed.length, topN: topStocks.length };
-
-  // 7. Output results
-  log("Publishing results...");
-
-  // Slack
-  const slackMsg = formatSlackMessage(strongBuys, allResults);
-  await postToSlack(slackMsg);
-
-  // GitHub Issue
-  const date = new Date().toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
-  const issueTitle = `📈 Weekly Scan ${date} — ${strongBuys.length} Strong Buy${strongBuys.length !== 1 ? "s" : ""} found`;
-  const issueBody = formatGithubIssue(strongBuys, allResults, screenerStats);
-  await createGithubIssue(issueTitle, issueBody);
-
-  // HTML dashboard for GitHub Pages
-  const outDir = path.resolve("dist");
-  mkdirSync(outDir, { recursive: true });
-  writeFileSync(path.join(outDir, "index.html"), formatHtmlPage(strongBuys, allResults, screenerStats));
-  log("  ✓ Generated dist/index.html");
-
-  // Always print to stdout (visible in GitHub Actions logs)
-  console.log("\n" + slackMsg.replace(/\*/g, ""));
-
-  log(`\nDone. Analyzed ${allResults.length} of ${CONFIG.topN} top-scored stocks.`);
-  log(`Strong Buys: ${strongBuys.map(r => r.ticker).join(", ") || "none"}`);
 }
 
 main().catch(e => {
