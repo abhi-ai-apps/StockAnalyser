@@ -34,6 +34,7 @@ jobs:
 
       - name: Deploy dashboard to GitHub Pages
         uses: JamesIves/github-pages-deploy-action@v4
+        continue-on-error: true
         with:
           folder: dist
           branch: gh-pages

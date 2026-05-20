@@ -74,9 +74,10 @@ async function getSP500Tickers() {
 
 async function fetchQuotesBatch(tickers) {
   try {
-    const results = await yahooFinance.quote(tickers);
+    const results = await yahooFinance.quote(tickers, {}, { validateResult: false });
     return Array.isArray(results) ? results : [results];
-  } catch {
+  } catch (e) {
+    log(`  Quote batch error: ${e.message}`);
     return [];
   }
 }
@@ -290,18 +291,21 @@ async function postToSlack(message) {
 
 async function createGithubIssue(title, body) {
   const token = process.env.GITHUB_TOKEN;
-  const repo = process.env.GITHUB_REPO; // e.g. "yourname/sp500-scanner"
-  if (!token || !repo) return;
+  const repo = process.env.GITHUB_REPO;
+  if (!token || !repo) { log("  ⚠ Skipping GitHub Issue (no token/repo)"); return; }
 
-  await fetch(`https://api.github.com/repos/${repo}/issues`, {
+  const res = await fetch(`https://api.github.com/repos/${repo}/issues`, {
     method: "POST",
-    headers: {
-      "Authorization": `Bearer ${token}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ title, body, labels: ["weekly-scan"] })
+    headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ title, body })
   });
-  log("  ✓ Created GitHub Issue");
+  if (res.ok) {
+    const data = await res.json();
+    log(`  ✓ Created GitHub Issue #${data.number}`);
+  } else {
+    const text = await res.text();
+    log(`  ✗ GitHub Issue failed (${res.status}): ${text.slice(0, 200)}`);
+  }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
