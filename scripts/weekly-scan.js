@@ -5,24 +5,21 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import yahooFinance from "yahoo-finance2";
 import { mkdirSync, writeFileSync } from "fs";
+import path from "path";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  batchSize: 5,            // Analyze 5 stocks at a time
-  stopAtStrongBuys: 3,     // Stop once we find this many STRONG BUYs
-  maxBatches: 10,          // Safety cap (never analyze more than 50 stocks)
-  delayBetweenCalls: 1000, // ms between Claude calls (rate limit buffer)
+  topN: 5,                 // Number of top-scored stocks to deep-analyze
+  delayBetweenCalls: 1000, // ms between Gemini calls (rate limit buffer)
 };
 
-// Aggressive pre-screen thresholds
+// Pre-screen thresholds — only fields reliably returned by yahooFinance.quote()
 const SCREEN = {
-  minRevenueGrowth: 0.15,  // >15% YoY
-  minFCF: 0,               // Positive FCF (TTM)
   minMarketCap: 2e9,       // >$2B
-  maxAnalystMean: 2.3,     // ≤2.3 (1=Strong Buy, 5=Sell) — analyst consensus
+  maxAnalystMean: 2.5,     // ≤2.5 analyst consensus (1=Strong Buy, 5=Sell)
 };
 
 // ─── Analyst System Prompt ────────────────────────────────────────────────────
@@ -100,21 +97,16 @@ async function fetchAllQuotes(tickers) {
   return allQuotes;
 }
 
-// ─── Step 3: Hard Filter ──────────────────────────────────────────────────────
+// ─── Step 3: Pre-filter ───────────────────────────────────────────────────────
+// Only uses fields reliably present in yahooFinance.quote() responses.
+// revenueGrowth and freeCashflow are in quoteSummary/financialData, not quote(),
+// so filtering on them here would silently wipe every stock.
 
-function hardFilter(quotes) {
+function preFilter(quotes) {
   return quotes.filter(q => {
-    const revGrowth = q.revenueGrowth ?? q.earningsGrowth ?? -1;
-    const fcf = q.freeCashflow ?? -1;
     const marketCap = q.marketCap ?? 0;
     const analystMean = q.recommendationMean ?? 5;
-
-    return (
-      revGrowth >= SCREEN.minRevenueGrowth &&
-      fcf > SCREEN.minFCF &&
-      marketCap >= SCREEN.minMarketCap &&
-      analystMean <= SCREEN.maxAnalystMean
-    );
+    return marketCap >= SCREEN.minMarketCap && analystMean <= SCREEN.maxAnalystMean;
   });
 }
 
@@ -238,7 +230,7 @@ function formatGithubIssue(strongBuys, allResults, screenerStats) {
   const FILTER_SHORT = ["Rev","Profit","FCF","B/S","Moat","Val","Lead","Risk"];
 
   let body = `## 📈 S&P 500 Weekly Scan — ${date}\n\n`;
-  body += `> Screened **${screenerStats.total}** stocks → **${screenerStats.afterFilter}** passed hard filters → analyzed **${allResults.length}** stocks in batches of 5\n\n`;
+  body += `> Screened **${screenerStats.total}** stocks → **${screenerStats.afterFilter}** passed pre-filter → top **${screenerStats.topN}** scored stocks analyzed by AI\n\n`;
 
   // Scorecard table
   body += `### Results\n\n`;
@@ -336,9 +328,141 @@ function printScorecard(results) {
   console.log();
 }
 
+// ─── Step 7: Generate HTML Dashboard ─────────────────────────────────────────
+
+function formatHtmlPage(strongBuys, allResults, screenerStats) {
+  const date = new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+  const iso = new Date().toISOString();
+  const FILTER_KEYS = ["revenueGrowth","profitability","freeCashFlow","balanceSheet","moat","valuation","leadership","risk"];
+  const FILTER_LABELS = ["Revenue","Profit","FCF","Bal. Sheet","Moat","Valuation","Leadership","Risk"];
+
+  const VERDICT_ORDER = { "STRONG BUY": 0, "BUY": 1, "WATCH": 2, "AVOID": 3, "STRONG AVOID": 4 };
+  const sorted = [...allResults].sort((a, b) =>
+    (VERDICT_ORDER[a.verdict] ?? 3) - (VERDICT_ORDER[b.verdict] ?? 3) || b.passCount - a.passCount
+  );
+
+  const verdictClass = { "STRONG BUY": "strong-buy", "BUY": "buy", "WATCH": "watch", "AVOID": "avoid", "STRONG AVOID": "strong-avoid" };
+  const ratingIcon = r => r === "PASS" ? "✅" : r === "FAIL" ? "❌" : "⚠️";
+
+  const rows = sorted.map(r => {
+    const ratings = FILTER_KEYS.map(k => `<td class="center">${ratingIcon(r.filters?.[k]?.rating)}</td>`).join("");
+    return `<tr>
+      <td><strong>${r.ticker}</strong></td>
+      <td>${r.companyName || ""}</td>
+      <td>${r.currentPrice || ""}</td>
+      ${ratings}
+      <td class="center">${r.passCount}/8</td>
+      <td><span class="verdict ${verdictClass[r.verdict] || ""}">${r.verdict}</span></td>
+    </tr>`;
+  }).join("\n");
+
+  const deepDives = strongBuys.map(r => {
+    const filterDetails = FILTER_KEYS.map((k, i) => {
+      const f = r.filters?.[k];
+      return `<li>${ratingIcon(f?.rating)} <strong>${FILTER_LABELS[i]}</strong>${f?.data ? ` <span class="data">[${f.data}]</span>` : ""}: ${f?.justification || ""}</li>`;
+    }).join("\n");
+    const thesis = (r.thesis || []).map(t => `<li>${t}</li>`).join("\n");
+    return `<div class="deep-dive">
+      <h3>${r.ticker} — ${r.companyName || ""}</h3>
+      <div class="meta">${r.currentPrice || ""} · ${r.marketCap || ""} · ${r.sector || ""}</div>
+      <h4>Investment Thesis</h4>
+      <ul class="thesis">${thesis}</ul>
+      ${r.nextCatalyst ? `<p class="catalyst">⚡ <strong>Next Catalyst:</strong> ${r.nextCatalyst}</p>` : ""}
+      <h4>Filter Breakdown</h4>
+      <ul class="filters">${filterDetails}</ul>
+    </div>`;
+  }).join("\n");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>S&P 500 Weekly Scan</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.6; }
+    .container { max-width: 1200px; margin: 0 auto; padding: 24px 16px; }
+    header { border-bottom: 1px solid #21262d; padding-bottom: 24px; margin-bottom: 32px; }
+    header h1 { font-size: 1.8rem; color: #58a6ff; }
+    header .subtitle { color: #8b949e; margin-top: 4px; }
+    .stats { display: flex; gap: 16px; flex-wrap: wrap; margin: 20px 0; }
+    .stat { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 12px 20px; min-width: 130px; }
+    .stat .label { font-size: 0.75rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }
+    .stat .value { font-size: 1.5rem; font-weight: 700; color: #e6edf3; }
+    h2 { font-size: 1.1rem; color: #e6edf3; margin: 32px 0 16px; border-left: 3px solid #58a6ff; padding-left: 12px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    th { background: #161b22; color: #8b949e; font-weight: 600; text-align: left; padding: 10px 12px; border-bottom: 1px solid #21262d; white-space: nowrap; }
+    td { padding: 10px 12px; border-bottom: 1px solid #161b22; white-space: nowrap; }
+    .center { text-align: center; }
+    tr:hover td { background: #161b22; }
+    .verdict { padding: 2px 8px; border-radius: 4px; font-size: 0.78rem; font-weight: 600; white-space: nowrap; }
+    .strong-buy { background: #1a3a1f; color: #3fb950; }
+    .buy        { background: #2d2a0f; color: #d29922; }
+    .watch      { background: #0e2044; color: #58a6ff; }
+    .avoid      { background: #3a1212; color: #f85149; }
+    .strong-avoid { background: #3a1212; color: #f85149; }
+    .deep-dive { background: #161b22; border: 1px solid #21262d; border-radius: 10px; padding: 24px; margin-bottom: 20px; }
+    .deep-dive h3 { color: #3fb950; font-size: 1.05rem; margin-bottom: 4px; }
+    .meta { color: #8b949e; font-size: 0.85rem; margin-bottom: 16px; }
+    .deep-dive h4 { color: #8b949e; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; margin: 16px 0 8px; }
+    .thesis li, .filters li { margin-left: 20px; margin-bottom: 6px; font-size: 0.88rem; }
+    .catalyst { margin-top: 12px; color: #d29922; font-size: 0.88rem; }
+    .data { color: #8b949e; font-size: 0.82rem; }
+    .no-results { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 32px; text-align: center; color: #8b949e; margin: 32px 0; }
+    footer { margin-top: 48px; border-top: 1px solid #21262d; padding-top: 16px; color: #8b949e; font-size: 0.8rem; }
+    footer a { color: #58a6ff; }
+    @media (max-width: 640px) { .stats { flex-direction: column; } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>📈 S&P 500 Weekly Scan</h1>
+      <div class="subtitle">${date}</div>
+      <div class="stats">
+        <div class="stat"><div class="label">Screened</div><div class="value">${screenerStats.total}</div></div>
+        <div class="stat"><div class="label">Passed Filters</div><div class="value">${screenerStats.afterFilter}</div></div>
+        <div class="stat"><div class="label">Top Analyzed</div><div class="value">${screenerStats.topN}</div></div>
+        <div class="stat"><div class="label">Strong Buys</div><div class="value" style="color:#3fb950">${strongBuys.length}</div></div>
+      </div>
+    </header>
+
+    ${allResults.length === 0 ? `
+    <div class="no-results">No results yet — the first scan runs every Monday at 9AM ET.</div>` : `
+    <h2>Results Scorecard</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Ticker</th><th>Company</th><th>Price</th>
+            ${FILTER_LABELS.map(l => `<th class="center">${l}</th>`).join("")}
+            <th class="center">Pass</th><th>Verdict</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+
+    ${strongBuys.length > 0 ? `
+    <h2>🏆 Strong Buy Deep Dives</h2>
+    ${deepDives}` : ""}`}
+
+    <footer>Generated by StockAnalyser at ${iso} &nbsp;·&nbsp; <a href="https://github.com/abhi-ai-apps/StockAnalyser/issues">View full scan history →</a></footer>
+  </div>
+</body>
+</html>`;
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
+  if (process.env.ENABLE_SCAN === "false") {
+    log("Scan disabled (ENABLE_SCAN=false). Exiting.");
+    process.exit(0);
+  }
+
   console.log("\n╔══════════════════════════════════════════════════════╗");
   console.log("║          S&P 500 AGGRESSIVE WEEKLY SCANNER          ║");
   console.log(`║          ${new Date().toLocaleDateString("en-US", { weekday:"long", month:"short", day:"numeric" }).padEnd(42)}║`);
@@ -350,67 +474,48 @@ async function main() {
   // 2. Fetch all quotes from Yahoo Finance (free, no key)
   const allQuotes = await fetchAllQuotes(allTickers);
 
-  // 3. Hard filter
-  const passed = hardFilter(allQuotes);
-  log(`\nHard filter: ${allQuotes.length} stocks → ${passed.length} passed`);
-  log(`  Criteria: Rev growth >${SCREEN.minRevenueGrowth*100}%, FCF>0, MCap>$${SCREEN.minMarketCap/1e9}B, Analyst≤${SCREEN.maxAnalystMean}`);
+  // 3. Pre-filter (market cap + analyst consensus only — both reliably in quote())
+  const passed = preFilter(allQuotes);
+  log(`\nPre-filter: ${allQuotes.length} stocks → ${passed.length} passed`);
+  log(`  Criteria: MCap>$${SCREEN.minMarketCap/1e9}B, Analyst≤${SCREEN.maxAnalystMean}`);
 
-  if (passed.length === 0) {
-    log("No stocks passed hard filter. Market conditions may be weak.");
-    await postToSlack("⚠️ Weekly Scan: No stocks passed hard filter this week.");
-    return;
-  }
-
-  // 4. Score and rank
+  // 4. Score and rank, then take top N for AI analysis
   const ranked = passed
     .map(q => ({ ...q, _score: scoreStock(q) }))
     .sort((a, b) => b._score - a._score);
 
-  log(`\nTop 10 by score:`);
-  for (const q of ranked.slice(0, 10)) {
-    log(`  ${q.symbol?.padEnd(6)} score:${q._score}  revGrowth:${((q.revenueGrowth||0)*100).toFixed(0)}%  analystMean:${(q.recommendationMean||0).toFixed(1)}`);
+  const topStocks = ranked.slice(0, CONFIG.topN);
+
+  log(`\nTop ${CONFIG.topN} by score (selected for AI analysis):`);
+  for (const q of topStocks) {
+    log(`  ${q.symbol?.padEnd(6)} score:${q._score}  epsGrowth:${((q.earningsQuarterlyGrowth||0)*100).toFixed(0)}%  analystMean:${(q.recommendationMean||0).toFixed(1)}  grossMargin:${((q.grossMargins||0)*100).toFixed(0)}%`);
   }
 
-  // 5. Analyze in batches of 5, stop when STRONG BUYs found
+  // 5. Deep AI analysis on top N
   const strongBuys = [];
   const allResults = [];
-  let batchNum = 0;
 
-  for (let i = 0; i < ranked.length && batchNum < CONFIG.maxBatches; i += CONFIG.batchSize) {
-    batchNum++;
-    const batch = ranked.slice(i, i + CONFIG.batchSize);
-    const tickers = batch.map(q => q.symbol).filter(Boolean);
-
-    log(`\n── Batch ${batchNum}: ${tickers.join(", ")} ──`);
-
-    for (const ticker of tickers) {
-      log(`  Analyzing ${ticker}...`);
-      const result = await analyzeStock(ticker);
-      if (result) {
-        allResults.push(result);
-        log(`  → ${ticker}: ${result.verdict} (${result.passCount}/8 pass)`);
-        if (result.verdict === "STRONG BUY") {
-          strongBuys.push(result);
-          log(`  ★ STRONG BUY: ${ticker}`);
-        }
+  log(`\n── Analyzing top ${topStocks.length} stocks with Gemini ──`);
+  for (const q of topStocks) {
+    const ticker = q.symbol;
+    if (!ticker) continue;
+    log(`  Analyzing ${ticker}...`);
+    const result = await analyzeStock(ticker);
+    if (result) {
+      allResults.push(result);
+      log(`  → ${ticker}: ${result.verdict} (${result.passCount}/8 pass)`);
+      if (result.verdict === "STRONG BUY") {
+        strongBuys.push(result);
+        log(`  ★ STRONG BUY: ${ticker}`);
       }
-      await sleep(CONFIG.delayBetweenCalls);
     }
-
-    if (strongBuys.length >= CONFIG.stopAtStrongBuys) {
-      log(`\n✓ Found ${strongBuys.length} STRONG BUYs — stopping early`);
-      break;
-    }
-
-    if (i + CONFIG.batchSize < ranked.length && batchNum < CONFIG.maxBatches) {
-      log(`  No STRONG BUY yet. Moving to next batch...`);
-    }
+    await sleep(CONFIG.delayBetweenCalls);
   }
 
   // 6. Print scorecard
   printScorecard(allResults);
 
-  const screenerStats = { total: allQuotes.length, afterFilter: passed.length };
+  const screenerStats = { total: allQuotes.length, afterFilter: passed.length, topN: topStocks.length };
 
   // 7. Output results
   log("Publishing results...");
@@ -425,10 +530,16 @@ async function main() {
   const issueBody = formatGithubIssue(strongBuys, allResults, screenerStats);
   await createGithubIssue(issueTitle, issueBody);
 
+  // HTML dashboard for GitHub Pages
+  const outDir = path.resolve("dist");
+  mkdirSync(outDir, { recursive: true });
+  writeFileSync(path.join(outDir, "index.html"), formatHtmlPage(strongBuys, allResults, screenerStats));
+  log("  ✓ Generated dist/index.html");
+
   // Always print to stdout (visible in GitHub Actions logs)
   console.log("\n" + slackMsg.replace(/\*/g, ""));
 
-  log(`\nDone. Analyzed ${allResults.length} stocks across ${batchNum} batches.`);
+  log(`\nDone. Analyzed ${allResults.length} of ${CONFIG.topN} top-scored stocks.`);
   log(`Strong Buys: ${strongBuys.map(r => r.ticker).join(", ") || "none"}`);
 }
 
