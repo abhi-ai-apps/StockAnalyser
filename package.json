@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Weekly S&P 500 aggressive screener + Gemini 8-filter analysis",
   "main": "scripts/weekly-scan.js",
+  "type": "module",
   "scripts": {
     "scan": "node scripts/weekly-scan.js"
   },
