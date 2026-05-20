@@ -3,9 +3,12 @@
 // Env:   GEMINI_API_KEY, SLACK_WEBHOOK (optional), GITHUB_TOKEN + GITHUB_REPO (optional)
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import yahooFinance from "yahoo-finance2";
+import _yahooFinance from "yahoo-finance2";
 import { mkdirSync, writeFileSync } from "fs";
 import path from "path";
+
+// yahoo-finance2 ESM/CJS interop: unwrap .default if present
+const yahooFinance = _yahooFinance.default ?? _yahooFinance;
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
