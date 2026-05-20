@@ -12,18 +12,14 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  batchSize: 5,            // Analyze 5 stocks at a time
-  stopAtStrongBuys: 3,     // Stop once we find this many STRONG BUYs
-  maxBatches: 10,          // Safety cap (never analyze more than 50 stocks)
-  delayBetweenCalls: 1000, // ms between Claude calls (rate limit buffer)
+  topN: 5,                 // Number of top-scored stocks to deep-analyze
+  delayBetweenCalls: 1000, // ms between Gemini calls (rate limit buffer)
 };
 
-// Aggressive pre-screen thresholds
+// Pre-screen thresholds — only fields reliably returned by yahooFinance.quote()
 const SCREEN = {
-  minRevenueGrowth: 0.15,  // >15% YoY
-  minFCF: 0,               // Positive FCF (TTM)
   minMarketCap: 2e9,       // >$2B
-  maxAnalystMean: 2.3,     // ≤2.3 (1=Strong Buy, 5=Sell) — analyst consensus
+  maxAnalystMean: 2.5,     // ≤2.5 analyst consensus (1=Strong Buy, 5=Sell)
 };
 
 // ─── Analyst System Prompt ────────────────────────────────────────────────────
@@ -101,21 +97,16 @@ async function fetchAllQuotes(tickers) {
   return allQuotes;
 }
 
-// ─── Step 3: Hard Filter ──────────────────────────────────────────────────────
+// ─── Step 3: Pre-filter ───────────────────────────────────────────────────────
+// Only uses fields reliably present in yahooFinance.quote() responses.
+// revenueGrowth and freeCashflow are in quoteSummary/financialData, not quote(),
+// so filtering on them here would silently wipe every stock.
 
-function hardFilter(quotes) {
+function preFilter(quotes) {
   return quotes.filter(q => {
-    const revGrowth = q.revenueGrowth ?? q.earningsGrowth ?? -1;
-    const fcf = q.freeCashflow ?? -1;
     const marketCap = q.marketCap ?? 0;
     const analystMean = q.recommendationMean ?? 5;
-
-    return (
-      revGrowth >= SCREEN.minRevenueGrowth &&
-      fcf > SCREEN.minFCF &&
-      marketCap >= SCREEN.minMarketCap &&
-      analystMean <= SCREEN.maxAnalystMean
-    );
+    return marketCap >= SCREEN.minMarketCap && analystMean <= SCREEN.maxAnalystMean;
   });
 }
 
@@ -239,7 +230,7 @@ function formatGithubIssue(strongBuys, allResults, screenerStats) {
   const FILTER_SHORT = ["Rev","Profit","FCF","B/S","Moat","Val","Lead","Risk"];
 
   let body = `## 📈 S&P 500 Weekly Scan — ${date}\n\n`;
-  body += `> Screened **${screenerStats.total}** stocks → **${screenerStats.afterFilter}** passed hard filters → analyzed **${allResults.length}** stocks in batches of 5\n\n`;
+  body += `> Screened **${screenerStats.total}** stocks → **${screenerStats.afterFilter}** passed pre-filter → top **${screenerStats.topN}** scored stocks analyzed by AI\n\n`;
 
   // Scorecard table
   body += `### Results\n\n`;
@@ -433,7 +424,7 @@ function formatHtmlPage(strongBuys, allResults, screenerStats) {
       <div class="stats">
         <div class="stat"><div class="label">Screened</div><div class="value">${screenerStats.total}</div></div>
         <div class="stat"><div class="label">Passed Filters</div><div class="value">${screenerStats.afterFilter}</div></div>
-        <div class="stat"><div class="label">AI Analyzed</div><div class="value">${allResults.length}</div></div>
+        <div class="stat"><div class="label">Top Analyzed</div><div class="value">${screenerStats.topN}</div></div>
         <div class="stat"><div class="label">Strong Buys</div><div class="value" style="color:#3fb950">${strongBuys.length}</div></div>
       </div>
     </header>
@@ -483,67 +474,48 @@ async function main() {
   // 2. Fetch all quotes from Yahoo Finance (free, no key)
   const allQuotes = await fetchAllQuotes(allTickers);
 
-  // 3. Hard filter
-  const passed = hardFilter(allQuotes);
-  log(`\nHard filter: ${allQuotes.length} stocks → ${passed.length} passed`);
-  log(`  Criteria: Rev growth >${SCREEN.minRevenueGrowth*100}%, FCF>0, MCap>$${SCREEN.minMarketCap/1e9}B, Analyst≤${SCREEN.maxAnalystMean}`);
+  // 3. Pre-filter (market cap + analyst consensus only — both reliably in quote())
+  const passed = preFilter(allQuotes);
+  log(`\nPre-filter: ${allQuotes.length} stocks → ${passed.length} passed`);
+  log(`  Criteria: MCap>$${SCREEN.minMarketCap/1e9}B, Analyst≤${SCREEN.maxAnalystMean}`);
 
-  if (passed.length === 0) {
-    log("No stocks passed hard filter. Market conditions may be weak.");
-    await postToSlack("⚠️ Weekly Scan: No stocks passed hard filter this week.");
-    return;
-  }
-
-  // 4. Score and rank
+  // 4. Score and rank, then take top N for AI analysis
   const ranked = passed
     .map(q => ({ ...q, _score: scoreStock(q) }))
     .sort((a, b) => b._score - a._score);
 
-  log(`\nTop 10 by score:`);
-  for (const q of ranked.slice(0, 10)) {
-    log(`  ${q.symbol?.padEnd(6)} score:${q._score}  revGrowth:${((q.revenueGrowth||0)*100).toFixed(0)}%  analystMean:${(q.recommendationMean||0).toFixed(1)}`);
+  const topStocks = ranked.slice(0, CONFIG.topN);
+
+  log(`\nTop ${CONFIG.topN} by score (selected for AI analysis):`);
+  for (const q of topStocks) {
+    log(`  ${q.symbol?.padEnd(6)} score:${q._score}  epsGrowth:${((q.earningsQuarterlyGrowth||0)*100).toFixed(0)}%  analystMean:${(q.recommendationMean||0).toFixed(1)}  grossMargin:${((q.grossMargins||0)*100).toFixed(0)}%`);
   }
 
-  // 5. Analyze in batches of 5, stop when STRONG BUYs found
+  // 5. Deep AI analysis on top N
   const strongBuys = [];
   const allResults = [];
-  let batchNum = 0;
 
-  for (let i = 0; i < ranked.length && batchNum < CONFIG.maxBatches; i += CONFIG.batchSize) {
-    batchNum++;
-    const batch = ranked.slice(i, i + CONFIG.batchSize);
-    const tickers = batch.map(q => q.symbol).filter(Boolean);
-
-    log(`\n── Batch ${batchNum}: ${tickers.join(", ")} ──`);
-
-    for (const ticker of tickers) {
-      log(`  Analyzing ${ticker}...`);
-      const result = await analyzeStock(ticker);
-      if (result) {
-        allResults.push(result);
-        log(`  → ${ticker}: ${result.verdict} (${result.passCount}/8 pass)`);
-        if (result.verdict === "STRONG BUY") {
-          strongBuys.push(result);
-          log(`  ★ STRONG BUY: ${ticker}`);
-        }
+  log(`\n── Analyzing top ${topStocks.length} stocks with Gemini ──`);
+  for (const q of topStocks) {
+    const ticker = q.symbol;
+    if (!ticker) continue;
+    log(`  Analyzing ${ticker}...`);
+    const result = await analyzeStock(ticker);
+    if (result) {
+      allResults.push(result);
+      log(`  → ${ticker}: ${result.verdict} (${result.passCount}/8 pass)`);
+      if (result.verdict === "STRONG BUY") {
+        strongBuys.push(result);
+        log(`  ★ STRONG BUY: ${ticker}`);
       }
-      await sleep(CONFIG.delayBetweenCalls);
     }
-
-    if (strongBuys.length >= CONFIG.stopAtStrongBuys) {
-      log(`\n✓ Found ${strongBuys.length} STRONG BUYs — stopping early`);
-      break;
-    }
-
-    if (i + CONFIG.batchSize < ranked.length && batchNum < CONFIG.maxBatches) {
-      log(`  No STRONG BUY yet. Moving to next batch...`);
-    }
+    await sleep(CONFIG.delayBetweenCalls);
   }
 
   // 6. Print scorecard
   printScorecard(allResults);
 
-  const screenerStats = { total: allQuotes.length, afterFilter: passed.length };
+  const screenerStats = { total: allQuotes.length, afterFilter: passed.length, topN: topStocks.length };
 
   // 7. Output results
   log("Publishing results...");
@@ -567,7 +539,7 @@ async function main() {
   // Always print to stdout (visible in GitHub Actions logs)
   console.log("\n" + slackMsg.replace(/\*/g, ""));
 
-  log(`\nDone. Analyzed ${allResults.length} stocks across ${batchNum} batches.`);
+  log(`\nDone. Analyzed ${allResults.length} of ${CONFIG.topN} top-scored stocks.`);
   log(`Strong Buys: ${strongBuys.map(r => r.ticker).join(", ") || "none"}`);
 }
 
