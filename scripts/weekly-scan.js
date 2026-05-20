@@ -7,8 +7,9 @@ import _yahooFinance from "yahoo-finance2";
 import { mkdirSync, writeFileSync } from "fs";
 import path from "path";
 
-// yahoo-finance2 ESM/CJS interop: unwrap .default if present
-const yahooFinance = _yahooFinance.default ?? _yahooFinance;
+// yahoo-finance2 exports the class itself; instantiate to access quote()
+const YahooFinanceClass = _yahooFinance.default ?? _yahooFinance;
+const yahooFinance = new YahooFinanceClass();
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
